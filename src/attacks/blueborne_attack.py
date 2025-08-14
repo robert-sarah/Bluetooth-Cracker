@@ -17,7 +17,7 @@ class BlueBorneAttack:
         self.running = False
         self.target_address = None
         self.callback = None
-        
+
     def execute(self, target_address: str, callback=None, **kwargs) -> bool:
         """Exécuter l'attaque BlueBorne"""
         self.target_address = target_address

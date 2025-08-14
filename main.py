@@ -329,10 +329,10 @@ class MainWindow(QMainWindow):
     def update_status(self):
         """Mise à jour du statut"""
         
-        if  self.bluetooth_manager.is_scanning():
+        if  self.bluetooth_manager.is_scanning:
             self.status_label.setText("Scanning...")
             self.status_label.setStyleSheet("color: #ffff00; padding: 5px;")
-        elif self.bluetooth_manager.is_attacking():
+        elif self.bluetooth_manager.is_attacking:
             self.status_label.setText("Attaque en cours...")
             self.status_label.setStyleSheet("color: #ff0000; padding: 5px;")
         else:

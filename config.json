@@ -1,0 +1,108 @@
+{
+  "bluetooth": {
+    "interface": "hci0",
+    "scan_duration": 30,
+    "continuous_scan": false,
+    "timeout": 10
+  },
+  "attacks": {
+    "blueborne": {
+      "enabled": true,
+      "timeout": 30,
+      "attempts": 3,
+      "delay": 1,
+      "stealth": false,
+      "verbose": true
+    },
+    "knob": {
+      "enabled": true,
+      "timeout": 20,
+      "attempts": 5,
+      "delay": 2,
+      "stealth": true,
+      "verbose": false
+    },
+    "bluesmack": {
+      "enabled": true,
+      "packet_count": 100,
+      "packet_size": 600,
+      "timeout": 15,
+      "delay": 0.05
+    },
+    "bluesnarf": {
+      "enabled": true,
+      "extract_contacts": true,
+      "extract_calendar": true,
+      "extract_messages": true,
+      "extract_files": true,
+      "timeout": 30
+    },
+    "bluejacking": {
+      "enabled": true,
+      "default_message": "Hello from BlueJacking!",
+      "timeout": 15
+    },
+    "l2cap_injection": {
+      "enabled": true,
+      "payload_type": "buffer_overflow",
+      "timeout": 20
+    },
+    "sdp_overflow": {
+      "enabled": true,
+      "overflow_size": 2048,
+      "timeout": 25
+    },
+    "pin_cracking": {
+      "enabled": true,
+      "max_attempts": 50,
+      "delay": 1,
+      "bruteforce": false
+    },
+    "bluebug": {
+      "enabled": true,
+      "default_command": "AT+CGSN",
+      "timeout": 20
+    }
+  },
+  "monitoring": {
+    "packet_capture": {
+      "enabled": true,
+      "auto_scroll": true,
+      "hex_view": false,
+      "packet_limit": 1000,
+      "filters": {
+        "packet_type": "all",
+        "direction": "both"
+      }
+    }
+  },
+  "logging": {
+    "level": "INFO",
+    "file": "/var/log/bluetooth-pentest.log",
+    "max_size": "10MB",
+    "backup_count": 5,
+    "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  },
+  "interface": {
+    "theme": "dark",
+    "language": "fr",
+    "auto_save": true,
+    "confirm_actions": true
+  },
+  "security": {
+    "require_root": true,
+    "log_attacks": true,
+    "anonymize_targets": false,
+    "encrypt_logs": false
+  },
+  "external_tools": {
+    "hcitool": "/usr/bin/hcitool",
+    "hciconfig": "/usr/bin/hciconfig",
+    "sdptool": "/usr/bin/sdptool",
+    "bluetoothctl": "/usr/bin/bluetoothctl",
+    "l2ping": "/usr/bin/l2ping",
+    "rfcomm": "/usr/bin/rfcomm",
+    "obexftp": "/usr/bin/obexftp",
+    "btmon": "/usr/bin/btmon"
+  }
+}

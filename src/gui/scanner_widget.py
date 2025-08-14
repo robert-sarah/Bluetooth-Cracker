@@ -1,435 +1,593 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Widget de scan Bluetooth pour l'interface PyQt5 - Version 100% fonctionnelle
+Widget de scan Bluetooth PyQt5 – Version robuste & 100% fonctionnelle (BlueZ)
+- Dépendances système : hciconfig, hcitool, bluetoothctl, sdptool (BlueZ)
+- Peut nécessiter sudo/capabilities pour hcitool/sdptool
 """
 
-from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
-                             QTableWidget, QTableWidgetItem, QLabel, QProgressBar,
-                             QGroupBox, QSpinBox, QCheckBox, QComboBox, QFileDialog,
-                             QMessageBox, QHeaderView)
+from PyQt5.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
+    QTableWidget, QTableWidgetItem, QLabel, QProgressBar,
+    QGroupBox, QSpinBox, QCheckBox, QFileDialog,
+    QMessageBox, QHeaderView
+)
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QThread
-from PyQt5.QtGui import QFont, QColor
+from PyQt5.QtGui import QColor, QGuiApplication, QCursor
+
 import subprocess
 import time
 import json
+import shutil
+import signal
 import os
+from typing import Dict, Any, List, Optional
+
+# =========================
+# Utilitaires système
+# =========================
+
+REQUIRED_CMDS = ["hciconfig", "hcitool", "bluetoothctl", "sdptool"]
+
+def cmd_exists(cmd: str) -> bool:
+    return shutil.which(cmd) is not None
+
+def ensure_commands_or_message(parent_widget: QWidget) -> bool:
+    missing = [c for c in REQUIRED_CMDS if not cmd_exists(c)]
+    if missing:
+        QMessageBox.critical(
+            parent_widget,
+            "Outils manquants",
+            "Les outils suivants sont introuvables :\n- "
+            + "\n- ".join(missing)
+            + "\n\nInstalle BlueZ (ex: sudo apt install bluez) puis réessaie."
+        )
+        return False
+    return True
+
+def run_checked(cmd: List[str], timeout: int = 10) -> subprocess.CompletedProcess:
+    """
+    Lance une commande en capturant stdout/stderr.
+    N'élève pas d'exception si returncode != 0 (on gère en amont).
+    """
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        cp = subprocess.CompletedProcess(cmd, returncode=124, stdout="", stderr=f"Timeout: {e}")
+        return cp
+    except Exception as e:
+        cp = subprocess.CompletedProcess(cmd, returncode=1, stdout="", stderr=str(e))
+        return cp
+
+def require_hci_up() -> Optional[str]:
+    """
+    Tente d'activer hci0. Retourne None si OK, sinon un message d'erreur utilisateur.
+    """
+    # Vérifier l'interface
+    cp = run_checked(["hciconfig"], timeout=5)
+    if cp.returncode != 0:
+        return "Impossible d'interroger l'interface Bluetooth (hciconfig)."
+
+    # Activer hci0
+    cp = run_checked(["hciconfig", "hci0", "up"], timeout=5)
+    if cp.returncode != 0:
+        # Permissions ? (sudo/cap)
+        return (
+            "Impossible d'activer l'interface hci0.\n"
+            "• Essaie avec sudo (ou donne des capabilities à hcitool/sdptool)\n"
+            "• Exemple: sudo setcap cap_net_raw+epi $(which hcitool)"
+        )
+    return None
+
+
+# =========================
+# Thread de Scan
+# =========================
 
 class BluetoothScanThread(QThread):
-    device_found = pyqtSignal(dict)
-    scan_complete = pyqtSignal(list)
+    device_found = pyqtSignal(dict)     # émis pour chaque découverte/maj
+    scan_complete = pyqtSignal(list)    # émis à la fin avec la liste unique
     scan_error = pyqtSignal(str)
-    
-    def __init__(self, duration=30):
-        super().__init__()
-        self.duration = duration
+
+    def __init__(self, duration: int = 30, parent=None):
+        super().__init__(parent)
+        self.duration = max(5, int(duration))
         self.running = False
-        
-    def run(self):
-        """Thread de scan Bluetooth réel"""
-        self.running = True
-        devices = []
-        
-        try:
-            # Activer l'interface Bluetooth
-            subprocess.run(['hciconfig', 'hci0', 'up'], capture_output=True, check=True)
-            
-            # Effectuer le scan avec hcitool
-            cmd = ['hcitool', 'scan', '--flush']
-            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            
-            start_time = time.time()
-            while time.time() - start_time < self.duration and self.running:
-                line = process.stdout.readline()
-                if not line:
-                    break
-                    
-                device = self.parse_scan_line(line)
-                if device:
-                    devices.append(device)
-                    self.device_found.emit(device)
-                    
-            process.terminate()
-            
-            if self.running:
-                self.scan_complete.emit(devices)
-                
-        except subprocess.CalledProcessError as e:
-            self.scan_error.emit(f"Erreur lors du scan: {e}")
-        except Exception as e:
-            self.scan_error.emit(f"Erreur inattendue: {e}")
-        finally:
-            self.running = False
-            
-    def parse_scan_line(self, line):
-        """Parser une ligne de scan hcitool"""
-        try:
-            parts = line.strip().split()
-            if len(parts) >= 2:
-                address = parts[0]
-                name = ' '.join(parts[1:]) if len(parts) > 1 else "Unknown"
-                
-                # Obtenir des informations supplémentaires
-                device_info = self.get_device_info(address)
-                
-                return {
-                    'address': address,
-                    'name': name,
-                    'type': device_info.get('type', 'unknown'),
-                    'rssi': device_info.get('rssi', -50),
-                    'services': device_info.get('services', []),
-                    'paired': device_info.get('paired', False),
-                    'connected': device_info.get('connected', False)
-                }
-        except Exception as e:
-            print(f"Erreur parsing ligne: {e}")
-        return None
-        
-    def get_device_info(self, address):
-        """Obtenir des informations détaillées sur l'appareil"""
-        info = {}
-        
-        try:
-            # Informations de base
-            cmd = ['hcitool', 'info', address]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-            
-            if result.returncode == 0:
-                output = result.stdout
-                
-                # Extraire le RSSI
-                if 'RSSI:' in output:
-                    rssi_line = [line for line in output.split('\n') if 'RSSI:' in line]
-                    if rssi_line:
-                        try:
-                            rssi = int(rssi_line[0].split(':')[1].strip())
-                            info['rssi'] = rssi
-                        except:
-                            pass
-                            
-                # Vérifier si l'appareil est appairé
-                info['paired'] = 'Paired: Yes' in output
-                info['connected'] = 'Connected: Yes' in output
-                
-            # Découvrir les services
-            services = self.discover_services(address)
-            info['services'] = services
-            
-            # Déterminer le type d'appareil
-            info['type'] = self.detect_device_type(info.get('name', ''))
-            
-        except Exception as e:
-            print(f"Erreur lors de l'obtention des infos: {e}")
-            
-        return info
-        
-    def discover_services(self, address):
-        """Découvrir les services d'un appareil"""
-        services = []
-        
-        try:
-            cmd = ['sdptool', 'browse', address]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-            
-            if result.returncode == 0:
-                lines = result.stdout.split('\n')
-                for line in lines:
-                    if 'service name:' in line.lower():
-                        service_name = line.split(':', 1)[1].strip()
-                        services.append(service_name)
-                        
-        except Exception as e:
-            print(f"Erreur lors de la découverte des services: {e}")
-            
-        return services
-        
-    def detect_device_type(self, name):
-        """Détecter le type d'appareil basé sur le nom"""
-        name_lower = name.lower()
-        
-        if any(word in name_lower for word in ['phone', 'mobile', 'samsung', 'iphone', 'huawei', 'xiaomi', 'oneplus']):
-            return 'phone'
-        elif any(word in name_lower for word in ['laptop', 'pc', 'computer', 'macbook', 'thinkpad', 'dell']):
-            return 'computer'
-        elif any(word in name_lower for word in ['headset', 'earbuds', 'airpods', 'jbl', 'sony']):
-            return 'headset'
-        elif any(word in name_lower for word in ['speaker', 'sound', 'audio', 'bose', 'harman']):
-            return 'speaker'
-        else:
-            return 'unknown'
-            
+        self._devices_by_addr: Dict[str, Dict[str, Any]] = {}
+
     def stop(self):
-        """Arrêter le scan"""
         self.running = False
 
+    # ---------- Parsers / helpers ----------
+
+    def parse_hcitool_scan_output(self, text: str) -> List[Dict[str, Any]]:
+        """
+        Parse la sortie de 'hcitool scan --flush'
+        Format typique:
+            Scanning ...
+                AA:BB:CC:DD:EE:FF    Device Name
+        """
+        devices = []
+        if not text:
+            return devices
+
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.lower().startswith("scanning"):
+                continue
+            # ligne typique: "AA:BB:CC:DD:EE:FF   Nom"
+            parts = line.split()
+            if len(parts) >= 1 and ":" in parts[0]:
+                address = parts[0]
+                name = line[len(address):].strip()
+                if name.startswith("(") and name.endswith(")"):  # edge cases
+                    name = name[1:-1].strip()
+                if not name:
+                    name = "Unknown"
+                devices.append({"address": address, "name": name})
+        return devices
+
+    def enrich_with_bluetoothctl(self, address: str, info: Dict[str, Any]) -> None:
+        """
+        Complète info depuis 'bluetoothctl info <ADDR>'
+        Cherche: RSSI, Paired, Connected, Icon/Type (si dispo)
+        """
+        cp = run_checked(["bluetoothctl", "info", address], timeout=6)
+        if cp.returncode != 0 or not cp.stdout:
+            # Valeurs par défaut si indisponible
+            info.setdefault("rssi", None)
+            info.setdefault("paired", False)
+            info.setdefault("connected", False)
+            return
+
+        rssi = None
+        paired = False
+        connected = False
+        dev_type = info.get("type", "unknown")
+
+        for ln in cp.stdout.splitlines():
+            line = ln.strip()
+            if line.startswith("RSSI:"):
+                try:
+                    rssi = int(line.split(":", 1)[1].strip())
+                except Exception:
+                    rssi = None
+            elif line.startswith("Paired:"):
+                paired = ("yes" in line.lower())
+            elif line.startswith("Connected:"):
+                connected = ("yes" in line.lower())
+            elif line.startswith("Icon:") and dev_type == "unknown":
+                # exemple: Icon: phone / audio-card / computer …
+                icon = line.split(":", 1)[1].strip().lower()
+                # map rapide
+                if any(k in icon for k in ["phone", "smartphone", "cellphone"]):
+                    dev_type = "phone"
+                elif "computer" in icon or "pc" in icon:
+                    dev_type = "computer"
+                elif any(k in icon for k in ["audio", "headset", "earbud", "headphones"]):
+                    dev_type = "headset"
+                elif "speaker" in icon:
+                    dev_type = "speaker"
+
+        info["rssi"] = rssi
+        info["paired"] = paired
+        info["connected"] = connected
+        info["type"] = dev_type
+
+    def discover_services(self, address: str, max_services: int = 30) -> List[str]:
+        """
+        Découvre des services via 'sdptool browse <ADDR>'.
+        Limite à max_services pour éviter de remplir la table sans fin.
+        """
+        cp = run_checked(["sdptool", "browse", address], timeout=12)
+        services: List[str] = []
+        if cp.returncode != 0 or not cp.stdout:
+            return services
+
+        for ln in cp.stdout.splitlines():
+            line = ln.strip()
+            if "Service Name:" in line or "service name:" in line.lower():
+                svc = line.split(":", 1)[1].strip()
+                if svc:
+                    services.append(svc)
+                    if len(services) >= max_services:
+                        break
+        return services
+
+    def detect_device_type_by_name(self, name: str) -> str:
+        name_lower = (name or "").lower()
+        if any(w in name_lower for w in ["phone", "mobile", "samsung", "iphone", "huawei", "xiaomi", "oneplus", "tecno", "infinix", "itel"]):
+            return "phone"
+        if any(w in name_lower for w in ["laptop", "pc", "computer", "macbook", "thinkpad", "dell", "hp", "asus", "acer"]):
+            return "computer"
+        if any(w in name_lower for w in ["headset", "earbuds", "airpods", "buds", "jbl", "sony", "anker", "beats"]):
+            return "headset"
+        if any(w in name_lower for w in ["speaker", "sound", "audio", "bose", "harman", "marshall"]):
+            return "speaker"
+        return "unknown"
+
+    # ---------- Run ----------
+
+    def run(self):
+        self.running = True
+        self._devices_by_addr.clear()
+
+        # 1) Activer l'interface
+        err = require_hci_up()
+        if err:
+            self.scan_error.emit(err)
+            self.running = False
+            return
+
+        start = time.time()
+        # 2) Boucles courtes jusqu’à durée totale
+        #    hcitool scan retourne tout de suite la liste actuelle; on itère
+        while self.running and (time.time() - start) < self.duration:
+            cp = run_checked(["hcitool", "scan", "--flush"], timeout=8)
+            if cp.returncode not in (0,):  # 0 = OK (parfois 1 à vide)
+                # message non bloquant – on continue pour voir si prochaine boucle marche
+                pass
+
+            # 3) Parse résultat de cette passe
+            discovered = self.parse_hcitool_scan_output(cp.stdout or "")
+            for d in discovered:
+                addr = d["address"]
+                # Construire/mettre à jour l’info
+                info = self._devices_by_addr.get(addr, {})
+                info["address"] = addr
+                info["name"] = d.get("name") or info.get("name") or "Unknown"
+
+                # Type par nom si inconnu
+                info.setdefault("type", self.detect_device_type_by_name(info["name"]))
+
+                # Enrichir avec bluetoothctl si pas déjà fait récemment
+                if "paired" not in info or "connected" not in info or "rssi" not in info:
+                    self.enrich_with_bluetoothctl(addr, info)
+
+                # Services si pas déjà récupéré
+                if "services" not in info:
+                    info["services"] = self.discover_services(addr)
+
+                # Défauts propres si rien trouvé
+                info.setdefault("paired", False)
+                info.setdefault("connected", False)
+                info.setdefault("rssi", None)
+                info.setdefault("services", [])
+
+                # Déterminer type si toujours inconnu
+                if info.get("type", "unknown") == "unknown":
+                    info["type"] = self.detect_device_type_by_name(info.get("name", ""))
+
+                self._devices_by_addr[addr] = info
+                # Emettre pour MAJ de table en temps réel
+                self.device_found.emit(info)
+
+            # petite pause pour ne pas saturer le bus
+            for _ in range(10):
+                if not self.running:
+                    break
+                time.sleep(0.1)
+
+        self.running = False
+        # 4) Fin
+        self.scan_complete.emit(list(self._devices_by_addr.values()))
+
+
+# =========================
+# Widget principal
+# =========================
+
 class BluetoothScannerWidget(QWidget):
-    device_selected = pyqtSignal(str)  # Signal émis quand un appareil est sélectionné
-    
-    def __init__(self, bluetooth_manager):
+    device_selected = pyqtSignal(str)  # adresse
+
+    def __init__(self, bluetooth_manager=None):  # bluetooth_manager optionnel
         super().__init__()
         self.bluetooth_manager = bluetooth_manager
-        self.scan_thread = None
-        self.devices = []
+        self.scan_thread: Optional[BluetoothScanThread] = None
+        self._rows_by_addr: Dict[str, int] = {}  # map addr -> row
+        self._devices_cache: Dict[str, Dict[str, Any]] = {}
+
         self.init_ui()
         self.setup_connections()
-        
+
+    # ---------- UI ----------
+
     def init_ui(self):
-        """Initialisation de l'interface"""
+        self.setWindowTitle("Bluetooth Scanner – BlueZ")
         layout = QVBoxLayout(self)
-        
-        # Groupe de contrôle
+
+        # Groupe contrôles
         control_group = QGroupBox("Contrôles de Scan")
         control_layout = QHBoxLayout(control_group)
-        
-        # Boutons de contrôle
+
         self.scan_button = QPushButton("🔍 Démarrer Scan")
-        self.scan_button.setMinimumHeight(40)
-        self.stop_button = QPushButton("⏹️ Arrêter Scan")
-        self.stop_button.setMinimumHeight(40)
+        self.scan_button.setMinimumHeight(36)
+        self.stop_button = QPushButton("⏹️ Arrêter")
+        self.stop_button.setMinimumHeight(36)
         self.stop_button.setEnabled(False)
-        
-        # Paramètres de scan
+
         self.duration_spin = QSpinBox()
-        self.duration_spin.setRange(5, 300)
+        self.duration_spin.setRange(5, 600)
         self.duration_spin.setValue(30)
         self.duration_spin.setSuffix(" sec")
-        
+
         self.continuous_check = QCheckBox("Scan continu")
-        
+
         control_layout.addWidget(self.scan_button)
         control_layout.addWidget(self.stop_button)
-        control_layout.addWidget(QLabel("Durée:"))
+        control_layout.addSpacing(12)
+        control_layout.addWidget(QLabel("Durée :"))
         control_layout.addWidget(self.duration_spin)
+        control_layout.addSpacing(12)
         control_layout.addWidget(self.continuous_check)
         control_layout.addStretch()
-        
         layout.addWidget(control_group)
-        
-        # Barre de progression
+
+        # Progression
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
         layout.addWidget(self.progress_bar)
-        
-        # Table des appareils
+
+        # Table devices
         devices_group = QGroupBox("Appareils Découverts")
         devices_layout = QVBoxLayout(devices_group)
-        
+
         self.devices_table = QTableWidget()
         self.devices_table.setColumnCount(7)
-        self.devices_table.setHorizontalHeaderLabels([
-            "Adresse", "Nom", "Type", "RSSI", "Services", "Appairé", "Connecté"
-        ])
-        
-        # Configuration de la table
+        self.devices_table.setHorizontalHeaderLabels(
+            ["Adresse", "Nom", "Type", "RSSI", "Services", "Appairé", "Connecté"]
+        )
         header = self.devices_table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)  # Adresse
-        header.setSectionResizeMode(1, QHeaderView.Stretch)           # Nom
-        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)  # Type
-        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)  # RSSI
-        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)  # Services
-        header.setSectionResizeMode(5, QHeaderView.ResizeToContents)  # Appairé
-        header.setSectionResizeMode(6, QHeaderView.ResizeToContents)  # Connecté
-        
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.Stretch)
+        header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(6, QHeaderView.ResizeToContents)
+
         self.devices_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.devices_table.setAlternatingRowColors(True)
-        
+        self.devices_table.setEditTriggers(QTableWidget.NoEditTriggers)
+
         devices_layout.addWidget(self.devices_table)
-        
-        # Boutons d'action
+
+        # Actions
         action_layout = QHBoxLayout()
         self.refresh_button = QPushButton("🔄 Actualiser")
         self.clear_button = QPushButton("🗑️ Effacer")
         self.export_button = QPushButton("💾 Exporter")
-        
         action_layout.addWidget(self.refresh_button)
         action_layout.addWidget(self.clear_button)
         action_layout.addWidget(self.export_button)
         action_layout.addStretch()
-        
+
         devices_layout.addLayout(action_layout)
         layout.addWidget(devices_group)
-        
-        # Statut
+
+        # Status
         self.status_label = QLabel("Prêt pour le scan")
-        self.status_label.setStyleSheet("color: #00ff00; font-weight: bold;")
+        self.status_label.setStyleSheet("color: #00aa00; font-weight: bold;")
         layout.addWidget(self.status_label)
-        
-        # Timer pour les mises à jour
-        self.update_timer = QTimer()
+
+        # Timer progression
+        self.update_timer = QTimer(self)
         self.update_timer.timeout.connect(self.update_progress)
-        
+
+        # Astuce UX : double-clic pour sélectionner
+        self.devices_table.doubleClicked.connect(self._on_double_click_row)
+
     def setup_connections(self):
-        """Configuration des connexions signal/slot"""
         self.scan_button.clicked.connect(self.start_scan)
         self.stop_button.clicked.connect(self.stop_scan)
         self.refresh_button.clicked.connect(self.refresh_devices)
         self.clear_button.clicked.connect(self.clear_devices)
         self.export_button.clicked.connect(self.export_devices)
-        
-        # Connexions au thread de scan
-        if hasattr(self, 'scan_thread') and self.scan_thread:
-            self.scan_thread.device_found.connect(self.on_device_found)
-            self.scan_thread.scan_complete.connect(self.on_scan_complete)
-            self.scan_thread.scan_error.connect(self.on_scan_error)
-        
+
+    # ---------- Scan control ----------
+
     def start_scan(self):
-        """Démarrer le scan"""
+        if not ensure_commands_or_message(self):
+            return
+
+        # Reset de la table si on ne veut pas cumuler
+        # (on garde pour refresh ; ici on conserve l’existant)
         duration = self.duration_spin.value()
-        
-        self.scan_button.setEnabled(False)
-        self.stop_button.setEnabled(True)
+
+        self._set_busy(True)
+        self.status_label.setText("Scan en cours…")
+        self.status_label.setStyleSheet("color: #d8a500; font-weight: bold;")
+
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, duration)
         self.progress_bar.setValue(0)
-        
-        self.status_label.setText("Scan en cours...")
-        self.status_label.setStyleSheet("color: #ffff00; font-weight: bold;")
-        
-        # Démarrer le thread de scan
+
         self.scan_thread = BluetoothScanThread(duration)
         self.scan_thread.device_found.connect(self.on_device_found)
         self.scan_thread.scan_complete.connect(self.on_scan_complete)
         self.scan_thread.scan_error.connect(self.on_scan_error)
         self.scan_thread.start()
-        
-        # Démarrer le timer de progression
+
         self.update_timer.start(1000)
-        
+
     def stop_scan(self):
-        """Arrêter le scan"""
-        if self.scan_thread:
+        if self.scan_thread and self.scan_thread.isRunning():
             self.scan_thread.stop()
-            self.scan_thread.wait()
-            
+            self.scan_thread.wait(3000)
+
         self.update_timer.stop()
-        
-        self.scan_button.setEnabled(True)
-        self.stop_button.setEnabled(False)
+        self._set_busy(False)
         self.progress_bar.setVisible(False)
-        
         self.status_label.setText("Scan arrêté")
-        self.status_label.setStyleSheet("color: #ff0000; font-weight: bold;")
-        
+        self.status_label.setStyleSheet("color: #cc0000; font-weight: bold;")
+
     def update_progress(self):
-        """Mettre à jour la barre de progression"""
         if self.scan_thread and self.scan_thread.running:
-            current = self.progress_bar.value()
-            if current < self.progress_bar.maximum():
-                self.progress_bar.setValue(current + 1)
-                
-    def on_device_found(self, device):
-        """Callback quand un appareil est trouvé"""
-        self.add_device_to_table(device)
-        
-    def on_scan_complete(self, devices):
-        """Callback quand le scan est terminé"""
+            cur = self.progress_bar.value()
+            if cur < self.progress_bar.maximum():
+                self.progress_bar.setValue(cur + 1)
+
+    # ---------- Slots thread ----------
+
+    def on_device_found(self, device: Dict[str, Any]):
+        self._devices_cache[device["address"]] = device
+        self._add_or_update_row(device)
+
+    def on_scan_complete(self, devices: List[Dict[str, Any]]):
         self.update_timer.stop()
-        self.scan_button.setEnabled(True)
-        self.stop_button.setEnabled(False)
+        self._set_busy(False)
         self.progress_bar.setVisible(False)
-        
-        self.status_label.setText(f"Scan terminé - {len(devices)} appareils trouvés")
-        self.status_label.setStyleSheet("color: #00ff00; font-weight: bold;")
-        
-    def on_scan_error(self, error_message):
-        """Callback en cas d'erreur de scan"""
+        self.status_label.setText(f"Scan terminé – {len(devices)} appareil(s) trouvé(s)")
+        self.status_label.setStyleSheet("color: #00aa00; font-weight: bold;")
+
+        # Scan continu ?
+        if self.continuous_check.isChecked():
+            # petite pause UX pour respirer
+            QTimer.singleShot(800, self.start_scan)
+
+    def on_scan_error(self, error_message: str):
         self.update_timer.stop()
-        self.scan_button.setEnabled(True)
-        self.stop_button.setEnabled(False)
+        self._set_busy(False)
         self.progress_bar.setVisible(False)
-        
+
         self.status_label.setText(f"Erreur: {error_message}")
-        self.status_label.setStyleSheet("color: #ff0000; font-weight: bold;")
-        
+        self.status_label.setStyleSheet("color: #cc0000; font-weight: bold;")
         QMessageBox.warning(self, "Erreur de Scan", error_message)
-        
-    def add_device_to_table(self, device):
-        """Ajouter un appareil à la table"""
-        row = self.devices_table.rowCount()
-        self.devices_table.insertRow(row)
-        
-        # Adresse
-        addr_item = QTableWidgetItem(device['address'])
-        addr_item.setData(Qt.UserRole, device['address'])
-        self.devices_table.setItem(row, 0, addr_item)
-        
+
+    # ---------- Table helpers ----------
+
+    def _add_or_update_row(self, d: Dict[str, Any]):
+        addr = d.get("address", "")
+        if not addr:
+            return
+
+        row = self._rows_by_addr.get(addr, -1)
+        if row == -1:
+            # nouvelle ligne
+            row = self.devices_table.rowCount()
+            self.devices_table.insertRow(row)
+            self._rows_by_addr[addr] = row
+
+            addr_item = QTableWidgetItem(addr)
+            addr_item.setData(Qt.UserRole, addr)
+            self.devices_table.setItem(row, 0, addr_item)
         # Nom
-        name_item = QTableWidgetItem(device['name'])
+        name_item = QTableWidgetItem(d.get("name", "Unknown"))
         self.devices_table.setItem(row, 1, name_item)
-        
+
         # Type
-        type_item = QTableWidgetItem(device['type'])
+        type_item = QTableWidgetItem(d.get("type", "unknown"))
         self.devices_table.setItem(row, 2, type_item)
-        
+
         # RSSI
-        rssi_item = QTableWidgetItem(str(device['rssi']))
+        rssi_val = d.get("rssi", None)
+        rssi_text = str(rssi_val) if isinstance(rssi_val, int) else "N/A"
+        rssi_item = QTableWidgetItem(rssi_text)
         self.devices_table.setItem(row, 3, rssi_item)
-        
+
         # Services
-        services_item = QTableWidgetItem(", ".join(device['services']))
+        services = d.get("services", [])
+        services_item = QTableWidgetItem(", ".join(services[:30]))
         self.devices_table.setItem(row, 4, services_item)
-        
+
         # Appairé
-        paired_item = QTableWidgetItem("✓" if device['paired'] else "✗")
-        paired_item.setForeground(QColor("#00ff00" if device['paired'] else "#ff0000"))
+        paired = bool(d.get("paired", False))
+        paired_item = QTableWidgetItem("✓" if paired else "✗")
+        paired_item.setForeground(QColor("#00aa00" if paired else "#cc0000"))
         self.devices_table.setItem(row, 5, paired_item)
-        
+
         # Connecté
-        connected_item = QTableWidgetItem("✓" if device['connected'] else "✗")
-        connected_item.setForeground(QColor("#00ff00" if device['connected'] else "#ff0000"))
+        connected = bool(d.get("connected", False))
+        connected_item = QTableWidgetItem("✓" if connected else "✗")
+        connected_item.setForeground(QColor("#00aa00" if connected else "#cc0000"))
         self.devices_table.setItem(row, 6, connected_item)
-        
+
+    # ---------- Actions ----------
+
     def refresh_devices(self):
-        """Actualiser la liste des appareils"""
-        self.devices_table.setRowCount(0)
-        self.devices.clear()
-        
-        # Relancer un scan rapide
+        """Efface la table et relance un scan rapide avec la durée actuelle"""
+        self.clear_devices()
         self.start_scan()
-        
+
     def clear_devices(self):
-        """Effacer la liste des appareils"""
         self.devices_table.setRowCount(0)
-        self.devices.clear()
-        
+        self._rows_by_addr.clear()
+        self._devices_cache.clear()
+
     def export_devices(self):
-        """Exporter la liste des appareils"""
-        filename, _ = QFileDialog.getSaveFileName(
+        fname, _ = QFileDialog.getSaveFileName(
             self, "Exporter les appareils", "", "Fichiers JSON (*.json);;Fichiers texte (*.txt)"
         )
-        
-        if filename:
-            try:
-                devices_data = []
-                for row in range(self.devices_table.rowCount()):
-                    device = {
-                        'address': self.devices_table.item(row, 0).text(),
-                        'name': self.devices_table.item(row, 1).text(),
-                        'type': self.devices_table.item(row, 2).text(),
-                        'rssi': int(self.devices_table.item(row, 3).text()),
-                        'services': self.devices_table.item(row, 4).text().split(", ") if self.devices_table.item(row, 4).text() else [],
-                        'paired': self.devices_table.item(row, 5).text() == "✓",
-                        'connected': self.devices_table.item(row, 6).text() == "✓"
-                    }
-                    devices_data.append(device)
-                
-                if filename.endswith('.json'):
-                    with open(filename, 'w', encoding='utf-8') as f:
-                        json.dump(devices_data, f, indent=2, ensure_ascii=False)
-                else:
-                    with open(filename, 'w', encoding='utf-8') as f:
-                        for device in devices_data:
-                            f.write(f"{device['address']}\t{device['name']}\t{device['type']}\t{device['rssi']}\n")
-                            
-                QMessageBox.information(self, "Succès", f"Appareils exportés dans {filename}")
-                
-            except Exception as e:
-                QMessageBox.critical(self, "Erreur", f"Erreur lors de l'export: {e}")
-        
-    def get_selected_device(self):
-        """Obtenir l'appareil sélectionné"""
-        current_row = self.devices_table.currentRow()
-        if current_row >= 0:
-            addr_item = self.devices_table.item(current_row, 0)
-            if addr_item:
-                return addr_item.data(Qt.UserRole)
+        if not fname:
+            return
+
+        try:
+            # construire depuis cache pour éviter des trous
+            devices_data = []
+            # S’assurer de l’ordre d’affichage
+            for row in range(self.devices_table.rowCount()):
+                addr = self.devices_table.item(row, 0).text()
+                name = self.devices_table.item(row, 1).text()
+                typ = self.devices_table.item(row, 2).text()
+                rssi_txt = self.devices_table.item(row, 3).text()
+                try:
+                    rssi = int(rssi_txt)
+                except Exception:
+                    rssi = None
+                services_txt = self.devices_table.item(row, 4).text()
+                services = [s.strip() for s in services_txt.split(",")] if services_txt else []
+                paired = self.devices_table.item(row, 5).text() == "✓"
+                connected = self.devices_table.item(row, 6).text() == "✓"
+
+                devices_data.append({
+                    "address": addr,
+                    "name": name,
+                    "type": typ,
+                    "rssi": rssi,
+                    "services": [s for s in services if s],
+                    "paired": paired,
+                    "connected": connected
+                })
+
+            if fname.endswith(".json"):
+                with open(fname, "w", encoding="utf-8") as f:
+                    json.dump(devices_data, f, indent=2, ensure_ascii=False)
+            else:
+                with open(fname, "w", encoding="utf-8") as f:
+                    for dev in devices_data:
+                        f.write(
+                            f"{dev['address']}\t{dev['name']}\t{dev['type']}\t{dev['rssi']}\t"
+                            f"{'|'.join(dev['services'])}\t{'Yes' if dev['paired'] else 'No'}\t"
+                            f"{'Yes' if dev['connected'] else 'No'}\n"
+                        )
+            QMessageBox.information(self, "Succès", f"Appareils exportés dans {fname}")
+        except Exception as e:
+            QMessageBox.critical(self, "Erreur", f"Erreur lors de l'export : {e}")
+
+    def get_selected_device(self) -> Optional[str]:
+        row = self.devices_table.currentRow()
+        if row >= 0:
+            item = self.devices_table.item(row, 0)
+            if item:
+                return item.data(Qt.UserRole)
         return None
+
+    # ---------- UX helpers ----------
+
+    def _set_busy(self, busy: bool):
+        self.scan_button.setEnabled(not busy)
+        self.stop_button.setEnabled(busy)
+        if busy:
+            self.setCursor(QCursor(Qt.BusyCursor))
+        else:
+            self.unsetCursor()
+
+    def _on_double_click_row(self):
+        addr = self.get_selected_device()
+        if addr:
+            self.device_selected.emit(addr)
+            # copie dans le presse-papiers pour commodité
+            cb = QGuiApplication.clipboard()
+            cb.setText(addr)
+            QMessageBox.information(self, "Appareil sélectionné",
+                                    f"Adresse copiée dans le presse-papiers : {addr}")
